@@ -1,0 +1,11 @@
+[project]
+name = "chameleon-mfc-dump"
+version = "0.1.0"
+description = "Dump MIFARE Classic 1K cards via the Chameleon Ultra"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "colorama==0.4.6",
+    "prompt-toolkit==3.0.39",
+    "pyserial==3.5",
+]

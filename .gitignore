@@ -1,0 +1,9 @@
+*.bin
+*.eml
+*.dic
+*.txt
+*.pyc
+__pycache__/
+.venv/
+vendor/
+bin/
