@@ -128,7 +128,8 @@ def load_existing_keys(path: Path, cmd, known) -> int:
 
 
 def dictionary_attack(cmd, dictionary, known, save=None):
-    """For each sector with an unknown A or B key, try every key in the dictionary."""
+    """For each sector with an unknown A or B key, try every key in the dictionary
+    via the firmware's batched check command (~33 keys/s, vs ~20/s one-by-one)."""
     for sector in range(SECTOR_COUNT):
         blk = first_block(sector)
         for kt_name, kt_val in (("A", KEY_A), ("B", KEY_B)):
@@ -136,11 +137,7 @@ def dictionary_attack(cmd, dictionary, known, save=None):
                 continue
             print(f"  sector {sector:2d} key {kt_name}: trying {len(dictionary)} keys ... ",
                   end="", flush=True)
-            found = None
-            for key in dictionary:
-                if auth(cmd, blk, kt_val, key):
-                    found = key
-                    break
+            found = _check_keys_batched(cmd, blk, kt_val, dictionary)
             if found is not None:
                 known[sector][kt_name] = found
                 print(f"{found.hex().upper()}")
