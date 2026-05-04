@@ -53,6 +53,42 @@ build_bin() {
     echo "    Built $(ls "$BIN_DIR" | wc -l | tr -d ' ') binaries"
 }
 
+build_hardnested() {
+    local src="$VENDOR_DIR/src"
+    local hn="$src/HardnestedRecovery"
+
+    # Find liblzma. pkg-config first; brew fallbacks for macOS Homebrew.
+    local lzma_cflags="" lzma_ldflags="-llzma"
+    if pkg-config --exists liblzma 2>/dev/null; then
+        lzma_cflags="$(pkg-config --cflags liblzma)"
+        lzma_ldflags="$(pkg-config --libs liblzma)"
+    elif [ -d /opt/homebrew/opt/xz ]; then
+        lzma_cflags="-I/opt/homebrew/opt/xz/include"
+        lzma_ldflags="-L/opt/homebrew/opt/xz/lib -llzma"
+    elif [ -d /usr/local/opt/xz ]; then
+        lzma_cflags="-I/usr/local/opt/xz/include"
+        lzma_ldflags="-L/usr/local/opt/xz/lib -llzma"
+    else
+        echo "==> Skipping hardnested: liblzma not found"
+        echo "    macOS:  brew install xz"
+        echo "    Debian: apt install liblzma-dev"
+        return
+    fi
+
+    echo "==> Building hardnested into $BIN_DIR/"
+    cc -O3 -D_GNU_SOURCE \
+        -I"$src" -I"$hn" -I"$hn/pm3" -I"$hn/hardnested" \
+        $lzma_cflags \
+        -o "$BIN_DIR/hardnested" \
+        "$src"/common.c "$src"/crapto1.c "$src"/crypto1.c "$src"/bucketsort.c "$src"/parity.c \
+        "$hn"/hardnested_main.c "$hn"/cmdhfmfhard.c \
+        "$hn"/pm3/ui.c "$hn"/pm3/util.c "$hn"/pm3/util_posix.c "$hn"/pm3/commonutil.c \
+        "$hn"/hardnested/hardnested_bf_core.c "$hn"/hardnested/hardnested_bruteforce.c \
+        "$hn"/hardnested/hardnested_bitarray_core.c "$hn"/hardnested/tables.c \
+        $lzma_ldflags -lpthread -lm
+    echo "    Built hardnested"
+}
+
 ensure_uv_deps() {
     if ! command -v uv > /dev/null; then
         echo "==> uv not installed; install from https://docs.astral.sh/uv/, then run: uv sync"
@@ -64,6 +100,7 @@ ensure_uv_deps() {
 
 fetch_vendor
 build_bin
+build_hardnested
 ensure_uv_deps
 echo
 echo "Setup complete. Run: uv run python dump_card.py"

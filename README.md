@@ -2,6 +2,26 @@
 
 Recover all MIFARE Classic 1K keys from a card on the Chameleon Ultra reader, then dump the full card.
 
+## Card support
+
+The script targets **MIFARE Classic 1K** layout: 16 sectors × 4 blocks × 16 bytes = 1024 B. At runtime it calls `mf1_detect_prng()` and dispatches to the correct attack based on the card's PRNG class, not its SAK byte. That covers all common 1K variants:
+
+| Card                                       | Typical SAK | PRNG class    | Attack used         |
+|--------------------------------------------|-------------|---------------|---------------------|
+| MIFARE Classic 1K (NXP S50, "classic")     | `0x08`      | nested        | nested              |
+| MIFARE Classic 1K (Infineon SLE 66R35)     | `0x88`      | nested        | nested              |
+| MIFARE Classic 1K EV1 (NXP)                | `0x08`      | hardnested    | hardnested          |
+| Magic gen1a / gen2 / gen4 1K clones        | varies      | nested        | nested              |
+| Fudan FM11RF08 (older silicon, weak PRNG)  | `0x08`      | staticnested  | staticnested        |
+
+Detection is automatic. Step `[2/3]` of every run prints `PRNG class: <name>` so you can see which path was taken.
+
+**Not supported by this script:**
+
+- **Fudan FM11RF08S** ("static encrypted" cards). Needs the backdoor-key attack via `staticnested_2x1nt_rf08s` and `mf1_static_encrypted_nested_acquire`. The C tools are built by `setup.sh` but the Python driver isn't wired up yet; use `hf mf senested` in the upstream CLI for these.
+- **MIFARE Classic Mini, 2K, 4K**. Different sector counts; the script's `SECTOR_COUNT = 16` would silently truncate. Easy to extend if needed.
+- **MIFARE Plus, MIFARE DESFire, Ultralight, NTAG**. Different protocols entirely.
+
 ## Setup
 
 This repo depends on the [ChameleonUltra](https://github.com/RfidResearchGroup/ChameleonUltra) source tree (Python modules + C cracker sources), pinned to a specific upstream commit. The dependency is fetched on demand into gitignored `vendor/`, never copied into git history.
@@ -93,7 +113,8 @@ The slot keeps its data across power cycles once `hw slot update` persists to fl
 
 ## Notes
 
-- The script handles **nested** and **staticnested** cards automatically (it calls `mf1_detect_prng` first). Hardnested cards (MIFARE Classic 1K EV1) fail with a clear message; the cracker is not currently bundled into `bin/` since it requires extra dependencies (xz). Build it separately from `vendor/ChameleonUltra/src/HardnestedRecovery/` if you need it.
+- The script calls `mf1_detect_prng` first and dispatches to nested, staticnested, or hardnested based on the card's PRNG class (see the card-support table above for the mapping). Hardnested needs `liblzma`/`xz` at build time (`brew install xz` on macOS, `apt install liblzma-dev` on Debian); `setup.sh` skips that binary if not found.
+- Hardnested is much slower than nested: nonce acquisition takes ~30 s to a few minutes per sector, and the offline crack is typically 1-5 minutes per key on a multi-core CPU. A full EV1 1K with 30+ unknown keys can take an hour or more.
 - Dictionary attack is silent during failures but prints `trying N keys ... none` per sector so you can see progress.
 - A failed nested attempt is normal because the attack is probabilistic; the script retries up to 3 times before giving up on a sector.
 - The `<UID>-dump.bin` patches the trailer key bytes from what we recovered; don't trust the keyA bytes that come straight off the card (access bits often hide them).
